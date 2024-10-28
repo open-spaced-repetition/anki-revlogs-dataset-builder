@@ -1,0 +1,6 @@
+revlogs/
+parquet/
+download/
+__pycache__/
+
+.DS_Store
