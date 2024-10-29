@@ -1,9 +1,10 @@
 from stats_pb2 import Dataset
 import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
-import pyarrow as pa
-import pyarrow.parquet as pq
+from tqdm import tqdm  # type: ignore
+import pyarrow as pa  # type: ignore
+import pyarrow.parquet as pq  # type: ignore
+from multiprocessing import Pool
 
 
 def filter_revlog(entries):
@@ -176,11 +177,17 @@ def test():
 
 def main():
     revlogs_folder = Path("revlogs")
+    revlog_files = tuple(revlogs_folder.glob("*.revlog"))
 
-    for revlog_file in tqdm(tuple(revlogs_folder.glob("*.revlog"))):
-        process_and_save(revlog_file)
+    with Pool() as pool:
+        list(
+            tqdm(
+                pool.imap_unordered(process_and_save, revlog_files),
+                total=len(revlog_files),
+            )
+        )
 
 
 if __name__ == "__main__":
-    # main()
-    test()
+    main()
+    # test()
