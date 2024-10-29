@@ -155,7 +155,7 @@ def save_to_parquet(df, table_name, user_id):
 
     df["user_id"] = user_id
     table = pa.Table.from_pandas(df)
-    output_path = Path(f"parquet/{table_name}")
+    output_path = Path(f"../anki-revlogs/{table_name}")
 
     pq.write_to_dataset(
         table,
