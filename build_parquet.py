@@ -144,7 +144,7 @@ def process_decks(df, id_mapper):
         return df
 
     df["deck_id"] = id_mapper.factorize(df["deck_id"], "deck_id")
-    df["parent_id"] = id_mapper.factorize(df["parent_id"], "parent_id")
+    df["parent_id"] = id_mapper.factorize(df["parent_id"], "deck_id")
     df["preset_id"] = id_mapper.factorize(df["preset_id"], "preset_id")
     return df
 
@@ -171,8 +171,7 @@ def save_to_parquet(df, table_name, user_id):
 
 
 def test():
-    for i in range(1, 11):
-        process_and_save(Path(f"./revlogs/{i}.revlog"))
+    process_and_save(Path(f"./revlogs/{70}.revlog"))
 
 
 def main():
