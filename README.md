@@ -9,6 +9,8 @@ This project provides utilities to:
 - Upload/download datasets to/from Hugging Face Hub
 - Show example of how to use the dataset
 
+The converted dataset is available on Hugging Face Hub: [Anki Revlogs 10K](https://huggingface.co/datasets/open-spaced-repetition/anki-revlogs-10k)
+
 ## Installation
 
 Required dependencies:
