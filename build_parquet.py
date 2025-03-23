@@ -1,4 +1,5 @@
-from stats_pb2 import Dataset
+from typing import Iterable
+from stats_pb2 import CardEntry, Dataset, DeckEntry, RevlogEntry
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm  # type: ignore
@@ -7,7 +8,7 @@ import pyarrow.parquet as pq  # type: ignore
 from multiprocessing import Pool
 
 
-def filter_revlog(entries):
+def filter_revlog(entries: Iterable[RevlogEntry]):
     return filter(
         lambda entry: entry.button_chosen >= 1
         and (entry.review_kind != 3 or entry.ease_factor != 0),
@@ -15,7 +16,7 @@ def filter_revlog(entries):
     )
 
 
-def convert_revlog(entries):
+def convert_revlog(entries: Iterable[RevlogEntry]):
     return map(
         lambda entry: {
             "review_time": entry.id,
@@ -28,7 +29,7 @@ def convert_revlog(entries):
     )
 
 
-def convert_card(entries):
+def convert_card(entries: Iterable[CardEntry]):
     return map(
         lambda entry: {
             "card_id": entry.id,
@@ -39,7 +40,7 @@ def convert_card(entries):
     )
 
 
-def convert_deck(entries):
+def convert_deck(entries: Iterable[DeckEntry]):
     return map(
         lambda entry: {
             "deck_id": entry.id,
