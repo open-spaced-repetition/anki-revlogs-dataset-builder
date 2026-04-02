@@ -22,6 +22,14 @@ huggingface_hub
 tqdm
 ```
 
+## Raw Data Setup
+
+Before running this project, download `revlogs.7z` from the Hugging Face dataset:
+
+[open-spaced-repetition/anki-revlogs-10k-raw](https://huggingface.co/datasets/open-spaced-repetition/anki-revlogs-10k-raw/)
+
+Extract the archive and place the `.revlog` files in the `revlogs/` directory at the repository root.
+
 ## Usage
 
 ### Converting Review Logs to Parquet
@@ -61,6 +69,7 @@ python process_dataset.py
 .
 ├── README.md
 ├── build_parquet.py    # Main conversion script
+├── revlogs/            # Extracted raw .revlog files
 ├── stats.proto         # Protocol Buffer definition
 ├── download_from_hf.py # Dataset download utility
 ├── upload_to_hf.py     # Dataset upload utility
