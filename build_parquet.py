@@ -1,11 +1,69 @@
-from typing import Iterable
-from stats_pb2 import CardEntry, Dataset, DeckEntry, RevlogEntry
-import pandas as pd
+"""Build the parquet dataset from the per-user `.revlog` protobufs.
+
+Run with no arguments this reproduces the published `anki-revlogs-10k` exactly; every
+behaviour change below is opt-in behind a flag.
+
+review_time semantics
+---------------------
+Anki writes a revlog row when the user *answers* a card, so `revlog.id` is the **answer
+time**, not the moment the card was shown. `--show-time` switches every derived quantity
+(`day_offset`, `elapsed_days`, `elapsed_seconds`, and the sort order) to the **show time**:
+
+    review_time = entry.id - entry.taken_millis
+
+which is what time-of-day and elapsed-time features actually want.
+
+Verified in the data rather than assumed. User 333, 296,002 rows, 18,149 cards with >= 2
+reviews: show times are monotone per card on all 18,149 cards, while answer times
+(`review_time + duration`) are monotone on only 18,008. That asymmetry can only arise if the
+stored column is the show time and durations vary.
+
+⚠ `taken_millis` is CLAMPED by Anki at the deck preset's "maximum answer seconds", so the
+correction is exact only for reviews under that cap. For a clamped review the subtraction is
+too small and the computed show time lands late by `actual - cap`. Measured over 60 users /
+6,265,897 reviews of the 10k set: **2.42 % of rows sit exactly at a cap** (per-user median
+3.3 %, p90 9.4 %, worst 25.0 %); the caps observed were 60 s (40 users), 180 s (8), 300 s (3)
+and 120 s (2). The correction is still strictly better than not correcting -- uncorrected,
+*every* row is late by its full duration -- and clamped rows remain identifiable, since the
+clamped value is what is stored: they are exactly the rows whose `duration` equals that user's
+cap. No flag column is emitted for them here, because detecting the cap requires either the
+preset config or a histogram heuristic, and neither belongs in this script by default.
+
+elapsed_seconds
+---------------
+`elapsed_seconds` is diffed in protobuf order (per-card blocks) and the frame is sorted by
+`review_time` only afterwards. Under `--show-time` the correction can reorder two adjacent
+reviews of one card, leaving a genuinely **negative** gap -- on user 333, 127 of 296,002 rows
+(0.043 %), ranging -58 s to -2 s, bounded by the review's own duration exactly as the mechanism
+predicts. Those are now clamped to 0 and counted.
+
+⚠ Count them as `elapsed_seconds < -1`, not `< 0`: `-1` is the existing "no known previous
+review" sentinel and accounts for a further ~6 % of rows in both variants, so a naive `< 0`
+test reports ~6.2 % and hides the real figure. Clamping to the `-1` sentinel instead of 0 is
+NOT safe -- it propagates into any per-card cumulative sum of `elapsed_seconds` and becomes
+`log(negative)` downstream. The published dataset contains no such rows, so this clamp is a
+no-op unless `--show-time` is used.
+"""
+
+import argparse
+from functools import partial
+from multiprocessing import Pool
 from pathlib import Path
-from tqdm import tqdm  # type: ignore
+from typing import Iterable
+
+import pandas as pd
 import pyarrow as pa  # type: ignore
 import pyarrow.parquet as pq  # type: ignore
-from multiprocessing import Pool
+from tqdm import tqdm  # type: ignore
+
+from stats_pb2 import CardEntry, Dataset, DeckEntry, RevlogEntry
+
+DEFAULT_REVLOGS_DIR = Path("revlogs")
+DEFAULT_OUTPUT_DIR = Path("../anki-revlogs-10k")
+
+# Anki ids are creation timestamps in epoch milliseconds (~1.7e12), so every id column must be
+# int64. int32 would SATURATE rather than raise, silently collapsing distinct entities into one.
+ID_DTYPE = "int64"
 
 
 def filter_revlog(entries: Iterable[RevlogEntry]):
@@ -16,10 +74,12 @@ def filter_revlog(entries: Iterable[RevlogEntry]):
     )
 
 
-def convert_revlog(entries: Iterable[RevlogEntry]):
+def convert_revlog(entries: Iterable[RevlogEntry], show_time: bool = False):
     return map(
         lambda entry: {
-            "review_time": entry.id,
+            # See the module docstring: revlog.id is the ANSWER time; subtracting the answer
+            # duration gives the SHOW time.
+            "review_time": entry.id - entry.taken_millis if show_time else entry.id,
             "card_id": entry.cid,
             "rating": entry.button_chosen,
             "state": entry.review_kind,
@@ -52,8 +112,16 @@ def convert_deck(entries: Iterable[DeckEntry]):
 
 
 class IdMapper:
-    def __init__(self):
+    """Maps Anki ids to small per-user integers.
+
+    With `factorize=False` the ids are passed through unchanged as int64, which is what the
+    `--raw-ids` variant wants: Anki ids *are* creation timestamps, so keeping them raw is what
+    makes card-age, note-age and creation-batch features derivable at all.
+    """
+
+    def __init__(self, factorize: bool = True):
         self._mappings = {}
+        self._factorize = factorize
 
     def get_mapping(self, column_name):
         if column_name not in self._mappings:
@@ -61,31 +129,45 @@ class IdMapper:
         return self._mappings[column_name]
 
     def factorize(self, series, column_name):
+        if not self._factorize:
+            # Explicit and asserted: a narrowing cast here would saturate, not raise.
+            out = series.astype(ID_DTYPE)
+            assert (out == series).all(), f"{column_name}: id lost precision as {ID_DTYPE}"
+            return out
         mapping = self.get_mapping(column_name)
         result = series.map(lambda x: mapping.setdefault(x, len(mapping)))
-        return result
+        return result.astype(ID_DTYPE)
 
 
-def process_and_save(file_path: Path):
+def process_and_save(
+    file_path: Path,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    raw_ids: bool = False,
+    show_time: bool = False,
+    emit_review_time: bool = False,
+):
     data = open(file_path, "rb").read()
     dataset = Dataset()
     dataset.ParseFromString(data)
 
-    id_mapper = IdMapper()
+    id_mapper = IdMapper(factorize=not raw_ids)
 
     df_revlogs = process_revlogs(
-        dataset, pd.DataFrame(convert_revlog(dataset.revlogs)), id_mapper
+        dataset,
+        pd.DataFrame(convert_revlog(dataset.revlogs, show_time=show_time)),
+        id_mapper,
+        emit_review_time=emit_review_time,
     )
     df_cards = process_cards(pd.DataFrame(convert_card(dataset.cards)), id_mapper)
     df_decks = process_decks(pd.DataFrame(convert_deck(dataset.decks)), id_mapper)
 
     user_id = int(file_path.stem)
-    save_to_parquet(df_revlogs, "revlogs", user_id)
-    save_to_parquet(df_cards, "cards", user_id)
-    save_to_parquet(df_decks, "decks", user_id)
+    save_to_parquet(df_revlogs, "revlogs", user_id, output_dir)
+    save_to_parquet(df_cards, "cards", user_id, output_dir)
+    save_to_parquet(df_decks, "decks", user_id, output_dir)
 
 
-def process_revlogs(dataset, df, id_mapper):
+def process_revlogs(dataset, df, id_mapper, emit_review_time: bool = False):
     if df.empty:
         return df
 
@@ -113,21 +195,30 @@ def process_revlogs(dataset, df, id_mapper):
     df["day_offset"] = df["day_offset"] - df["day_offset"].min()
     df["elapsed_days"] = df["day_offset"].diff().fillna(0).astype("int64")
     df["elapsed_seconds"] = (df["review_time"].diff().fillna(0) / 1000).astype("int64")
+
+    # Explicit handling of genuinely negative gaps (see the module docstring). Done BEFORE the
+    # -1 sentinels are written so this cannot clobber them. A no-op on answer-time data; only
+    # --show-time can reorder rows within a card block.
+    negative = df["elapsed_seconds"] < 0
+    if negative.any():
+        df.loc[negative, "elapsed_seconds"] = 0
+
     df.loc[df["state"] == 0, "elapsed_days"] = -1
     df.loc[df["state"] == 0, "elapsed_seconds"] = -1
     df["card_id"] = id_mapper.factorize(df["card_id"], "card_id")
     df.sort_values(by="review_time", inplace=True)
-    return df[
-        [
-            "card_id",
-            "day_offset",
-            "rating",
-            "state",
-            "duration",
-            "elapsed_days",
-            "elapsed_seconds",
-        ]
+    columns = [
+        "card_id",
+        "day_offset",
+        "rating",
+        "state",
+        "duration",
+        "elapsed_days",
+        "elapsed_seconds",
     ]
+    if emit_review_time:
+        columns.append("review_time")
+    return df[columns]
 
 
 def process_cards(df, id_mapper):
@@ -150,13 +241,13 @@ def process_decks(df, id_mapper):
     return df
 
 
-def save_to_parquet(df, table_name, user_id):
+def save_to_parquet(df, table_name, user_id, output_dir: Path = DEFAULT_OUTPUT_DIR):
     if df.empty:
         return
 
     df["user_id"] = user_id
     table = pa.Table.from_pandas(df)
-    output_path = Path(f"../anki-revlogs-10k/{table_name}")
+    output_path = Path(output_dir) / table_name
 
     pq.write_to_dataset(
         table,
@@ -171,18 +262,56 @@ def save_to_parquet(df, table_name, user_id):
         file.rename(new_name)
 
 
-def test():
-    process_and_save(Path(f"./revlogs/{70}.revlog"))
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Build the anki-revlogs parquet dataset from per-user .revlog protobufs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--revlogs-dir", type=Path, default=DEFAULT_REVLOGS_DIR,
+        help="directory containing the per-user *.revlog protobufs",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
+        help="directory to write the revlogs/ cards/ decks/ parquet trees into",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="worker processes (default: one per CPU)",
+    )
+    parser.add_argument(
+        "--raw-ids", action="store_true",
+        help="keep raw Anki ids (int64 epoch-ms) instead of factorizing them to small ints",
+    )
+    parser.add_argument(
+        "--show-time", action="store_true",
+        help="derive times from the card SHOW time (revlog.id - taken_millis) instead of the "
+             "answer time; see the module docstring for the clamping caveat",
+    )
+    parser.add_argument(
+        "--emit-review-time", action="store_true",
+        help="include the absolute review_time column (epoch ms) in the revlogs table",
+    )
+    return parser.parse_args(argv)
 
 
-def main():
-    revlogs_folder = Path("revlogs")
-    revlog_files = tuple(revlogs_folder.glob("*.revlog"))
+def main(argv=None):
+    args = parse_args(argv)
+    revlog_files = tuple(Path(args.revlogs_dir).glob("*.revlog"))
+    if not revlog_files:
+        raise SystemExit(f"no *.revlog files found in {args.revlogs_dir}")
 
-    with Pool() as pool:
+    worker = partial(
+        process_and_save,
+        output_dir=args.output_dir,
+        raw_ids=args.raw_ids,
+        show_time=args.show_time,
+        emit_review_time=args.emit_review_time,
+    )
+    with Pool(processes=args.workers) as pool:
         list(
             tqdm(
-                pool.imap_unordered(process_and_save, revlog_files),
+                pool.imap_unordered(worker, revlog_files),
                 total=len(revlog_files),
             )
         )
@@ -190,4 +319,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # test()
