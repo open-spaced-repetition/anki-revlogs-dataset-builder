@@ -197,13 +197,11 @@ def process_revlogs(dataset, df, id_mapper, emit_review_time: bool = False):
     df["elapsed_seconds"] = (df["review_time"].diff().fillna(0) / 1000).astype("int64")
 
     # Explicit handling of genuinely negative gaps (see the module docstring). Done BEFORE the
-    # -1 sentinels are written so this cannot clobber them, and reported rather than silent.
-    # A no-op on answer-time data; only --show-time can reorder rows within a card block.
+    # -1 sentinels are written so this cannot clobber them. A no-op on answer-time data; only
+    # --show-time can reorder rows within a card block.
     negative = df["elapsed_seconds"] < 0
-    n_negative = int(negative.sum())
-    if n_negative:
+    if negative.any():
         df.loc[negative, "elapsed_seconds"] = 0
-        df.attrs["n_negative_elapsed_seconds"] = n_negative
 
     df.loc[df["state"] == 0, "elapsed_days"] = -1
     df.loc[df["state"] == 0, "elapsed_seconds"] = -1

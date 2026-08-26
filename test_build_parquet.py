@@ -97,7 +97,9 @@ def build(tmp: Path, argv):
 def test_default_matches_upstream():
     """No flags => byte-for-byte the previous script's output."""
     old_src = subprocess.run(
-        ["git", "show", "HEAD:build_parquet.py"], cwd=HERE,
+        # The test runs from the PR checkout, so HEAD is the new script.  HEAD^ is the
+        # base-version script that the compatibility claim is actually about.
+        ["git", "show", "HEAD^:build_parquet.py"], cwd=HERE,
         capture_output=True, text=True, check=True).stdout
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -160,10 +162,15 @@ def test_show_time_shifts_and_review_time_column():
             show = read_table(build(Path(td2), ["--show-time", "--emit-review-time"]),
                               "revlogs")
         assert "review_time" in ans.columns and "review_time" in show.columns
-        # every show time is earlier than its answer time by exactly that row's duration
-        merged = ans.sort_values("review_time").reset_index(drop=True)
-        s = show.sort_values("review_time").reset_index(drop=True)
-        assert (s["review_time"] <= merged["review_time"]).all()
+        # The show-time transform must preserve every row and subtract exactly its own
+        # duration, even when the transform changes the output ordering.
+        expected = ans.assign(expected_show_time=ans["review_time"] - ans["duration"])[
+            ["card_id", "duration", "expected_show_time"]
+        ].sort_values(["card_id", "duration", "expected_show_time"]).reset_index(drop=True)
+        actual = show[["card_id", "duration", "review_time"]].rename(
+            columns={"review_time": "expected_show_time"}
+        ).sort_values(["card_id", "duration", "expected_show_time"]).reset_index(drop=True)
+        pd.testing.assert_frame_equal(expected, actual, check_exact=True)
     print("  --show-time moves review_time earlier           OK")
 
 
