@@ -187,6 +187,61 @@ def test_negative_elapsed_seconds_clamped():
     print("  negative elapsed_seconds clamped to 0           OK")
 
 
+def test_end_to_start_is_prev_end_to_current_start():
+    """`--elapsed-end-to-start` must yield start(k) - end(k-1), and must yield the SAME
+    number with and without `--show-time` -- the flag derives both endpoints itself, so the
+    meaning of `review_time` cannot leak into the gap."""
+    with tempfile.TemporaryDirectory() as td:
+        ans = read_table(build(Path(td), ["--elapsed-end-to-start", "--emit-review-time"]),
+                         "revlogs")
+    with tempfile.TemporaryDirectory() as td:
+        show = read_table(
+            build(Path(td), ["--show-time", "--elapsed-end-to-start", "--emit-review-time"]),
+            "revlogs",
+        )
+    key = ["card_id", "duration", "elapsed_seconds"]
+    pd.testing.assert_frame_equal(
+        ans[key].sort_values(key).reset_index(drop=True),
+        show[key].sort_values(key).reset_index(drop=True),
+        check_exact=True,
+    )
+
+    # Card A, review 2. `revlog.id` IS end(k), so end(1) = BASE and
+    # start(2) = BASE + DAY - 8_000  ->  86400 - 8 = 86392 s. (Review 1's own duration does
+    # NOT appear: it ended at end(1), which is where the gap starts.)
+    a = ans[(ans["state"] != 0) & (ans["elapsed_seconds"] > 1000)]
+    assert 86392 in set(a["elapsed_seconds"]), sorted(a["elapsed_seconds"])
+    print("  end-to-start = end(k-1) -> start(k)             OK")
+
+
+def test_end_to_start_clamps_and_keeps_sentinel():
+    """Card B's two reviews are 30 s apart and the first took 3 s, so end-to-start is short by
+    a whole previous duration far more often than under --show-time alone. Those rows must
+    clamp to 0, never stay negative and never become the -1 'no previous review' sentinel."""
+    for argv in (["--elapsed-end-to-start"], ["--show-time", "--elapsed-end-to-start"]):
+        with tempfile.TemporaryDirectory() as td:
+            rev = read_table(build(Path(td), argv), "revlogs")
+            assert (rev["elapsed_seconds"] >= -1).all(), rev["elapsed_seconds"].tolist()
+            bad = rev[(rev["elapsed_seconds"] == -1) & (rev["state"] != 0)]
+            assert bad.empty, bad
+    print("  end-to-start clamps to 0, sentinel preserved    OK")
+
+
+def test_end_to_start_leaves_elapsed_days_alone():
+    """elapsed_days is a calendar-day index difference; the correction must not touch it."""
+    with tempfile.TemporaryDirectory() as td:
+        base = read_table(build(Path(td), []), "revlogs")
+    with tempfile.TemporaryDirectory() as td:
+        e2s = read_table(build(Path(td), ["--elapsed-end-to-start"]), "revlogs")
+    key = ["card_id", "day_offset", "elapsed_days"]
+    pd.testing.assert_frame_equal(
+        base[key].sort_values(key).reset_index(drop=True),
+        e2s[key].sort_values(key).reset_index(drop=True),
+        check_exact=True,
+    )
+    print("  elapsed_days untouched by end-to-start          OK")
+
+
 def test_no_emit_review_time_by_default():
     with tempfile.TemporaryDirectory() as td:
         rev = read_table(build(Path(td), []), "revlogs")
@@ -199,7 +254,11 @@ if __name__ == "__main__":
     for fn in (test_default_matches_upstream, test_default_ids_still_factorized,
                test_raw_ids_are_int64_and_unfactorized,
                test_show_time_shifts_and_review_time_column,
-               test_negative_elapsed_seconds_clamped, test_no_emit_review_time_by_default):
+               test_negative_elapsed_seconds_clamped,
+               test_end_to_start_is_prev_end_to_current_start,
+               test_end_to_start_clamps_and_keeps_sentinel,
+               test_end_to_start_leaves_elapsed_days_alone,
+               test_no_emit_review_time_by_default):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
