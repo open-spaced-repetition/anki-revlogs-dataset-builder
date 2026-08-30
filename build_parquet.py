@@ -43,6 +43,54 @@ test reports ~6.2 % and hides the real figure. Clamping to the `-1` sentinel ins
 NOT safe -- it propagates into any per-card cumulative sum of `elapsed_seconds` and becomes
 `log(negative)` downstream. The published dataset contains no such rows, so this clamp is a
 no-op unless `--show-time` is used.
+
+end-to-END vs end-to-START (`--elapsed-end-to-start`)
+-----------------------------------------------------
+A review occupies an interval, not an instant. Write `start(k)` for the moment the card is
+shown and `end(k)` for the moment it is answered, so `duration(k) = end(k) - start(k)` and
+`revlog.id` is `end(k)`.
+
+The diff above measures a gap between two timestamps of the SAME kind, so which quantity it
+produces depends on which kind `review_time` holds:
+
+    default        end(k)   - end(k-1)       "end-to-END"
+    --show-time    start(k) - start(k-1)     "start-to-START"
+
+Neither is the span over which the memory decays. Decay begins when the user finished being
+shown the answer, `end(k-1)`, and the test happens when the card is next shown, `start(k)`:
+
+    --elapsed-end-to-start    start(k) - end(k-1)       "end-to-START"
+
+`--show-time` moves the near endpoint but not the far one, so a start-to-START gap still
+carries `duration(k-1)` inside it. There is a second, stronger reason to prefer end-to-start:
+`duration(k)` does not exist at prediction time (the card has been shown and not yet answered)
+and it correlates with the outcome, because a review the user struggles with takes longer.
+end-to-END therefore hides a prediction-time-unavailable, outcome-correlated quantity inside
+the interval.
+
+The flag is independent of `--show-time`: both endpoints are derived explicitly, so it yields
+`start(k) - end(k-1)` either way. It does NOT touch `elapsed_days` -- that is a calendar-day
+index difference matching Anki's scheduling semantics, "subtract a duration" is not well
+defined on a day index, and the effect at day resolution is ~0.001 %.
+
+Unlike start-to-START, end-to-START almost never goes negative: a card is not shown again
+before the previous review was answered, so `start(k) >= end(k-1)` holds physically. Measured
+per card over 40 stride-sampled users of the 10k set (2,306,229 rows with a previous review of
+the same card): **2 rows**, the worst -2.0 s. Both have a mechanism, neither is clock drift:
+
+* a **zero-duration entry** (0.067 % of rows; Anki writes these for manual reschedules and when
+  it bumps a colliding revlog id). Its `start` equals its own `id`, so it can land inside a real
+  review's span -- and once two rows overlap, sorting by `start` no longer preserves `end`
+  order, so "the previous row by start" can have the later end.
+* a **1 ms overlap**, where one review's answer and the next one's show fall on adjacent
+  milliseconds.
+
+Both are covered by the existing clamp.
+
+What the correction does produce is more **sub-second** gaps, since it removes a whole duration
+rather than a difference of two: **0.222 % of eligible rows** land in [0, 1) s and truncate to a
+0 s gap. That is not a problem here -- 0 is a legitimate value -- but consumers that filter on a
+strictly positive interval will drop those rows, so it is worth stating.
 """
 
 import argparse
@@ -145,6 +193,7 @@ def process_and_save(
     raw_ids: bool = False,
     show_time: bool = False,
     emit_review_time: bool = False,
+    end_to_start: bool = False,
 ):
     data = open(file_path, "rb").read()
     dataset = Dataset()
@@ -157,6 +206,8 @@ def process_and_save(
         pd.DataFrame(convert_revlog(dataset.revlogs, show_time=show_time)),
         id_mapper,
         emit_review_time=emit_review_time,
+        show_time=show_time,
+        end_to_start=end_to_start,
     )
     df_cards = process_cards(pd.DataFrame(convert_card(dataset.cards)), id_mapper)
     df_decks = process_decks(pd.DataFrame(convert_deck(dataset.decks)), id_mapper)
@@ -167,7 +218,14 @@ def process_and_save(
     save_to_parquet(df_decks, "decks", user_id, output_dir)
 
 
-def process_revlogs(dataset, df, id_mapper, emit_review_time: bool = False):
+def process_revlogs(
+    dataset,
+    df,
+    id_mapper,
+    emit_review_time: bool = False,
+    show_time: bool = False,
+    end_to_start: bool = False,
+):
     if df.empty:
         return df
 
@@ -194,7 +252,15 @@ def process_revlogs(dataset, df, id_mapper, emit_review_time: bool = False):
     )
     df["day_offset"] = df["day_offset"] - df["day_offset"].min()
     df["elapsed_days"] = df["day_offset"].diff().fillna(0).astype("int64")
-    df["elapsed_seconds"] = (df["review_time"].diff().fillna(0) / 1000).astype("int64")
+    if end_to_start:
+        # end-to-START: end(k-1) -> start(k) (see the module docstring). Derive both endpoints
+        # explicitly, because `review_time` holds start(k) under --show-time and end(k)
+        # otherwise, so this stays correct either way.
+        start = df["review_time"] if show_time else df["review_time"] - df["duration"]
+        gap = start - (start + df["duration"]).shift()
+        df["elapsed_seconds"] = (gap.fillna(0) / 1000).astype("int64")
+    else:
+        df["elapsed_seconds"] = (df["review_time"].diff().fillna(0) / 1000).astype("int64")
 
     # Explicit handling of genuinely negative gaps (see the module docstring). Done BEFORE the
     # -1 sentinels are written so this cannot clobber them. A no-op on answer-time data; only
@@ -289,6 +355,12 @@ def parse_args(argv=None):
              "answer time; see the module docstring for the clamping caveat",
     )
     parser.add_argument(
+        "--elapsed-end-to-start", action="store_true",
+        help="measure elapsed_seconds end-to-start, i.e. from the previous review's end to "
+             "this review's start (the span over which memory decays), instead of between two "
+             "same-kind timestamps; see the module docstring",
+    )
+    parser.add_argument(
         "--emit-review-time", action="store_true",
         help="include the absolute review_time column (epoch ms) in the revlogs table",
     )
@@ -307,6 +379,7 @@ def main(argv=None):
         raw_ids=args.raw_ids,
         show_time=args.show_time,
         emit_review_time=args.emit_review_time,
+        end_to_start=args.elapsed_end_to_start,
     )
     with Pool(processes=args.workers) as pool:
         list(
